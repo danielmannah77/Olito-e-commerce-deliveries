@@ -1,0 +1,196 @@
+As promised, here is the github file containing the SQL queries I used in the video as well as a few extra queries.
+
+***I know it isn't practice to write queries in low case, it is a bad habit that i have formed. I'm working on it!
+
+the first query in the video investigated the relationship between late delivery percentages and average review scores for each city:
+
+with cte as (select oc.order_id,
+oc.customer_id,
+order_status, 
+customer_city, 
+ case when cast(order_delivered_customer_date as date) > cast(order_estimated_delivery_date as date)
+ then 'Late delivery'
+ when cast(order_delivered_customer_date as date) < cast(order_estimated_delivery_date as date)
+ then 'Early delivery'
+ else 'on time'
+ end as delivery_status
+from {{raw.google_sheets.ordercore}} oc
+inner join {{raw.google_sheets.items}} i
+on oc.order_id = i.order_id
+inner join {{raw.google_sheets.customers}} c
+on oc.customer_id = c.customer_id
+where order_delivered_customer_date is not null),
+
+totals as (select
+distinct customer_city,
+count(distinct order_id) as total_orders
+from cte
+group by 1 having total_orders >= 10),
+
+latecounts as (select distinct customer_city,
+count(distinct order_id) as num_late_orders
+from cte
+where delivery_status = 'Late delivery'
+group by 1),
+
+review_scores as
+(select customer_city, 
+round(avg(review_score), 2) as avg_review_score from
+{{raw.google_sheets.reviews}} r
+inner join {{raw.google_sheets.ordercore}} oc
+on oc.order_id = r.order_id
+inner join {{raw.google_sheets.customers}} c
+on c.customer_id = oc.customer_id
+group by 1)
+
+select lc.customer_city,
+num_late_orders,
+total_orders,
+round(num_late_orders/total_orders * 100,2) as late_delivery_percentage,
+r.avg_review_score
+from latecounts lc
+inner join totals t
+on lc.customer_city = t.customer_city
+inner join review_scores r 
+on lc.customer_city = r.customer_city
+order by 4 desc
+
+next, wondering if early deliveries encouraged repeat purchases, I wrote this query to look at the percentage of early deliveries for repeat customers,
+and designed it in a way that it can be changed to see the percentage for one-time customers:
+
+with cte as (select c.customer_unique_id,
+case when c.customer_unique_id in 
+(select customer_unique_id
+from (select customer_unique_id, count(customer_id) as num_purchases
+from {{raw.google_sheets.customers}}
+group by 1 
+having num_purchases > 1)) then 'Repeat customer' else 'One time customer'
+end as customer_type,
+case when cast(order_delivered_customer_date as date) > cast(order_estimated_delivery_date as date)
+ then 'Late delivery'
+ when cast(order_delivered_customer_date as date) < cast(order_estimated_delivery_date as date)
+ then 'Early delivery'
+ else 'on time'
+ end as delivery_status
+from {{raw.google_sheets.customers}} c
+inner join {{raw.google_sheets.ordercore}} o
+on c.customer_id = o.customer_id
+where order_delivered_customer_date is not null)
+
+select round((select count(*)
+from cte
+where customer_type = 'Repeat customer' and
+delivery_status = 'Early delivery')/ count(*), 2)
+from cte            
+where customer_type = 'Repeat customer'
+
+next I zoomed in on a specific subset of customers - those who fall under the 'repeat customer' category but have at least one order that went undelivered.
+I wanted to look at each customer's order history - from first purchase to last purchase - and see whether the undelivered order deterred them from 
+making another order:
+
+select * from 
+{{raw.google_sheets.customers}} c
+inner join {{raw.google_sheets.ordercore}} o
+on c.customer_id = o.customer_id
+where customer_unique_id in
+(select customer_unique_id
+from {{raw.google_sheets.customers}} c
+inner join {{raw.google_sheets.ordercore}} o
+on c.customer_id = o.customer_id
+where customer_unique_id in
+(
+    select customer_unique_id
+    from (
+        select customer_unique_id, count(distinct customer_id)
+        from {{raw.google_sheets.customers}}
+        group by 1
+        having count(distinct customer_id) > 1
+    )
+) 
+and c.customer_id in 
+(select customer_id
+from {{raw.google_sheets.ordercore}} o 
+inner join {{raw.google_sheets.reviews}} r
+on o.order_id = r.order_id
+where order_status = 'shipped'
+and order_delivered_customer_date is null)
+group by 1
+having count(c.customer_id) = 1
+order by customer_unique_id)
+order by customer_unique_id, order_purchase_timestamp
+
+next I wanted to see which combinations of seller city and customer city had the highest (or lowest) average lead times for shipping and delivery:
+
+with cte as 
+(select ordercore.order_id,
+sellers.seller_id,
+
+case when sellers.seller_city like('s%pau%o') 
+or sellers.seller_city in('sp', 'sp / sp','sao paulo sp', 'sao paulo - sp', 'sao paulo / sao paulo')
+then 'Sao Paulo'
+else sellers.seller_city
+end as seller_city,
+
+customers.customer_city,
+
+cast(shipping_limit_date as date) shipping_limit_date,
+
+cast(order_delivered_carrier_date as date) delivered_to_carrier,
+
+cast(order_estimated_delivery_date as date) estimated_customer_delivery,
+
+cast(order_delivered_customer_date as date) actual_customer_delivery,
+
+from {{raw.google_sheets.ordercore}} ordercore
+
+inner join {{raw.google_sheets.items}} items
+on ordercore.order_id = items.order_id
+inner join {{raw.google_sheets.sellers}} sellers
+on items.seller_id = sellers.seller_id
+inner join {{raw.google_sheets.customers}} customers
+on ordercore.customer_id = customers.customer_id
+where cast(order_delivered_customer_date as date) is not null)
+
+select
+seller_city,
+customer_city,
+round(avg(date_diff(shipping_limit_date, delivered_to_carrier, day)),2) as avg_shipping_difference,
+round(avg(date_diff(estimated_customer_delivery, actual_customer_delivery, day)),2) as avg_delivery_difference
+from cte
+group by 1, 2
+order by 3 desc
+
+finally, I thought it would be interesting to investigate whether the weight of an order had an impact on whether a deliver was late, early or on time:
+
+with order_item_products as 
+(select o.order_id as o_id, 
+i.product_id as product_id,
+cast(p.product_weight_g as int) as item_weight_g
+from {{raw.google_sheets.ordercore}} o 
+inner join {{raw.google_sheets.items}} i
+on o.order_id = i.order_id
+inner join {{raw.google_sheets.products}} p 
+on i.product_id = p.product_id
+order by o.order_id),
+
+weights as 
+(select o_id as order_id,
+sum(item_weight_g) as order_weight_g
+from order_item_products
+group by 1)
+
+select oc.order_id, 
+cast(order_estimated_delivery_date as date) estimated_delivery,
+cast(order_delivered_customer_date as date) actual_delivery,
+case when
+(date_diff(cast (order_estimated_delivery_date as date), cast(order_delivered_customer_date as date), day)) = 0 then "on time"
+ when (date_diff(cast (order_estimated_delivery_date as date), cast(order_delivered_customer_date as date), day)) > 0 then "early delivery"
+else "late delivery" end as delivery_status,
+order_weight_g/1000 as order_weight_kg,
+from {{raw.google_sheets.ordercore}} oc
+inner join weights 
+on oc.order_id = weights.order_id
+where order_delivered_customer_date is not null
+
+
+Thank you for reading!
